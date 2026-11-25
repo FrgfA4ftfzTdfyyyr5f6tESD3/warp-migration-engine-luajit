@@ -1,0 +1,15 @@
+# Local runtime config & personal relay credentials
+config.json
+
+# Runtime AI state, telemetry & generated policies
+ai_report.json
+telemetry.json
+brain_state.json
+mask_memory.json
+evolved_policy.lua
+test_telemetry.json
+
+# OS / Editor artifacts
+*.log
+.DS_Store
+Thumbs.db
