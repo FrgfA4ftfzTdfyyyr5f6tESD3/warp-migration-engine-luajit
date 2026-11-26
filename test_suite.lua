@@ -130,7 +130,7 @@ T.init_session_log("test_session.log")
 T.session_meta.engine_mode = "masque"
 T.session_meta.warp_auto_setup = true
 T.log_line("[TEST] Unified logger verification")
-assert(T.flush_json("test_telemetry.json") == true)
+assert(T.flush_json("test_telemetry.json", true) == true)
 T.close_session_log()
 os.remove("test_telemetry.json")
 os.remove("test_session.log")

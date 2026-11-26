@@ -500,7 +500,7 @@ local function run_masque_engine(cfg)
                         sess.post_hs_1rtt = sess.post_hs_1rtt + 1
                         local elapsed_hs = T.now_ms() - sess.hs_confirmed_ms
                         local bidi_ready = (sess.srv_1rtt >= 30 and sess.post_hs_1rtt >= 45 and elapsed_hs >= 6500)
-                        local cap_ready  = (sess.post_hs_1rtt >= 60 and elapsed_hs >= 8500) or sess.post_hs_1rtt >= 180
+                        local cap_ready  = (sess.post_hs_1rtt >= 60 and elapsed_hs >= 8500) or (elapsed_hs >= 6500 and sess.post_hs_1rtt >= 180)
                         if bidi_ready or cap_ready then
                             sess.migrated = true
                             is_primary_mig = true

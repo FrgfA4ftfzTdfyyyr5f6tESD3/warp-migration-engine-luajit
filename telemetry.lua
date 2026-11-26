@@ -685,7 +685,7 @@ function M.synthesize_policy_from_features()
     local dyn_st  = math.max(2200, math.min(5500, math.floor(M.get_dynamic_stall_ms() * 0.85)))
     local code = string.format(
         "return function(ctx)\n" ..
-        "  if ctx.jitter_ms > %d and ctx.large_pkt_ratio < 0.35 then\n" ..
+        "  if ctx.rx_tx_ratio < 0.35 and ctx.jitter_ms > %d and ctx.large_pkt_ratio < 0.35 then\n" ..
         "    return { action = 'DIVERSE_SWITCH', stall_ms = %d }\n" ..
         "  end\n" ..
         "  return nil\n" ..
@@ -704,6 +704,9 @@ function M.eval_evolved_policy()
     local ok, res = pcall(active_policy_fn, eval_ctx)
     if not ok then
         M.rollback_evolved_policy()
+        return nil
+    end
+    if res and res.action == "DIVERSE_SWITCH" and last_features.rx_tx >= 0.5 then
         return nil
     end
     return res
@@ -922,14 +925,14 @@ local function json_escape(str)
     return (str:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'))
 end
 
-function M.flush_json(filepath)
+function M.flush_json(filepath, skip_brain_save)
     filepath = filepath or "ai_report.json"
     local f = io.open(filepath, "w")
     if not f then return false end
 
     local audit = M.analyze_anomalies()
     local mem_kb = collectgarbage("count")
-    M.save_mask_memory()
+    if not skip_brain_save then M.save_mask_memory() end
 
     f:write("{\n")
     f:write(string.format('  "uptime_ms": %.2f,\n', M.now_ms() - start_ms))
