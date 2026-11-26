@@ -5,6 +5,7 @@
 -- 4. Unsupervised Pattern Discovery (DISCOVERED_PATTERN_#) & Code x Network Cross-Correlation
 
 local ffi = require("ffi")
+local C = require("common")
 
 local M = {}
 
@@ -68,16 +69,16 @@ local PROTO_FAMILY = {
     [16]="esp", [17]="rtp",
 }
 
--- Boot Self-Anatomy & End-to-End Digital Twin (Client + Server Contract)
+-- Boot Self-Anatomy & End-to-End Digital Twin (Synced with common.lua + server.lua Contract)
 M.E2E_SYSTEM_MODEL = {
-    client_pipeline    = { "Framing", "Mask(1..17)", "Pacing", "WinDivert_FFI", "StateMachine" },
+    client_pipeline    = { "WinDivert_FFI", "QUIC_Dissector", "Mask(1..17)", "BiDi_1RTT_Grace", "AuxGuard" },
     server_contract    = {
-        outbound_env_v4 = 16,
-        outbound_env_v6 = 28,
-        inbound_camo    = 8,
-        session_ttl_s   = 60,
+        outbound_env_v4 = C.OUTBOUND_PREPEND_LEN_V4,
+        outbound_env_v6 = C.OUTBOUND_PREPEND_LEN_V6,
+        inbound_camo    = C.INBOUND_STRIP_LEN,
+        session_ttl_s   = C.RELAY_SESSION_TTL_S,
         min_proto_id    = 1,
-        max_proto_id    = 17,
+        max_proto_id    = #C.PROTOCOLS,
         safe_stall_min  = 2200,
         safe_stall_max  = 6000,
         safe_pacing_max = 50,
@@ -85,12 +86,12 @@ M.E2E_SYSTEM_MODEL = {
 }
 
 M.self_identity = {
-    mission      = "Maximize Direct 1-RTT RX | Zero Stall | Preserve 17 Fixed Protocols",
+    mission      = "Maximize Direct MASQUE 1-RTT RX | Zero Stall | Preserve 17 Fixed Protocols",
     jit_version  = jit and jit.version or "Lua",
     jit_enabled  = jit and jit.status and (jit.status() == true) or false,
     boot_mem_kb  = collectgarbage("count"),
     modules      = { "common.lua", "client.lua", "telemetry.lua", "server.lua" },
-    fixed_protos = 17,
+    fixed_protos = #C.PROTOCOLS,
 }
 
 -- Circadian Time Bucket (0=night, 1=morning, 2=afternoon, 3=evening)
@@ -435,6 +436,47 @@ M.live = {
     stall_count     = 0,
     active_endpoint = "",
 }
+
+M.session_meta = {
+    engine_mode     = "masque",
+    relay_endpoint  = "",
+    target_endpoint = "",
+    warp_auto_setup = false,
+    warp_mode       = "manual",
+    migration_rule  = "BiDi-1RTT (4rx+10tx >=1.2s) / 3.5s Cap",
+}
+
+local log_file = nil
+
+function M.init_session_log(filepath)
+    filepath = filepath or "wme_session.log"
+    if log_file then pcall(function() log_file:close() end) end
+    log_file = io.open(filepath, "w")
+    if log_file then
+        log_file:write(string.format("=== Warp Migration Engine Session Log (%s) ===\n", os.date("%Y-%m-%d %H:%M:%S")))
+        log_file:flush()
+    end
+    return log_file ~= nil
+end
+
+function M.log_line(line)
+    print(line)
+    io.flush()
+    if log_file then
+        log_file:write(line .. "\n")
+        log_file:flush()
+    end
+end
+
+function M.close_session_log()
+    if log_file then
+        pcall(function()
+            log_file:write(string.format("=== Session Closed (%s) ===\n", os.date("%Y-%m-%d %H:%M:%S")))
+            log_file:close()
+        end)
+        log_file = nil
+    end
+end
 
 local function ensure_proto(pid)
     if not proto_stats[pid] then
@@ -799,16 +841,17 @@ function M.analyze_anomalies()
             best_id = pid
         end
 
+        local pkey = C.get_protocol_by_id(pid).key
         if s.attempts > 0 and s.inbound_pkts == 0 and s.migrated == 0 then
-            anomalies[#anomalies + 1] = string.format("[DPI_ALERT] Proto %d had 0 server responses.", pid)
+            anomalies[#anomalies + 1] = string.format("[DPI_ALERT] Proto %d (%s) had 0 server responses.", pid, pkey)
         end
         if s.backup_trig > 0 then
-            anomalies[#anomalies + 1] = string.format("[BOTTLENECK] Proto %d used Backup 20-Pkt trigger %dx.", pid, s.backup_trig)
+            anomalies[#anomalies + 1] = string.format("[BOTTLENECK] Proto %d (%s) used Backup 20-Pkt trigger %dx.", pid, pkey, s.backup_trig)
         end
         if s.stalls > 0 then
             local cause, domain, pat = M.attribute_and_discover()
             local extra = pat and (" | " .. pat) or ""
-            anomalies[#anomalies + 1] = string.format("[%s] Proto %d stalled %dx (%s%s).", domain, pid, s.stalls, cause, extra)
+            anomalies[#anomalies + 1] = string.format("[%s] Proto %d (%s) stalled %dx (%s%s).", domain, pid, pkey, s.stalls, cause, extra)
         end
     end
 
@@ -840,34 +883,39 @@ end
 function M.print_diagnostic_summary()
     local a = M.analyze_anomalies()
     local mem_kb = collectgarbage("count")
-    print("\n---------------- DUAL-PERSPECTIVE AI BRAIN SUMMARY -------------")
-    print(string.format("  Health Score     : %d / 100 | Avg Mig: %.1f ms (Welford: %.1f ms)",
-        a.health_score, a.avg_migration_ms, w_mig_ms.mean))
-    print(string.format("  Code Phases      : Current=%s | Mig->ReArm Loops=%d",
-        M.PHASE_NAMES[current_phase] or "?", mig_to_rearm_loops))
-    print(string.format("  Triggers         : Primary=%d | Backup=%d | Stalls=%d | Drops=%d",
-        a.primary_triggers, a.backup_triggers, M.live.stall_count, a.total_drops))
-    print(string.format("  Direct 1-RTT     : TX=%d pkts (%.1f KB) | RX=%d pkts (%.1f KB)",
-        M.live.direct_tx_pkts, M.live.direct_tx_bytes / 1024,
-        M.live.direct_rx_pkts, M.live.direct_rx_bytes / 1024))
-    print(string.format("  Welford Baseline : RX/TX=%.2f | LargePkt=%.2f | Jitter=%.1fms | DynStall=%.0fms",
-        w_rx_tx_ratio.mean, w_large_ratio.mean, w_jitter_ms.mean, M.get_dynamic_stall_ms()))
-    print(string.format("  LuaJIT Engine    : Mem=%.1f KB | Traces=%d Compiled / %d Aborted",
-        mem_kb, M.jit_stats.traces_compiled, M.jit_stats.traces_aborted))
-    print(string.format("  Discovered Pats  : %d | UCB1 Best Mask: %d | Endpoint: %s",
-        #discovered_patterns, a.recommended_mask, M.live.active_endpoint ~= "" and M.live.active_endpoint or "N/A"))
+    local lines = {
+        "\n---------------- DUAL-PERSPECTIVE AI BRAIN SUMMARY -------------",
+        string.format("  Health Score     : %d / 100 | Avg Mig: %.1f ms (Welford: %.1f ms)",
+            a.health_score, a.avg_migration_ms, w_mig_ms.mean),
+        string.format("  Code Phases      : Current=%s | Mig->ReArm Loops=%d",
+            M.PHASE_NAMES[current_phase] or "?", mig_to_rearm_loops),
+        string.format("  Triggers         : Primary=%d | Backup=%d | Stalls=%d | Drops=%d",
+            a.primary_triggers, a.backup_triggers, M.live.stall_count, a.total_drops),
+        string.format("  Direct 1-RTT     : TX=%d pkts (%.1f KB) | RX=%d pkts (%.1f KB)",
+            M.live.direct_tx_pkts, M.live.direct_tx_bytes / 1024,
+            M.live.direct_rx_pkts, M.live.direct_rx_bytes / 1024),
+        string.format("  Welford Baseline : RX/TX=%.2f | LargePkt=%.2f | Jitter=%.1fms | DynStall=%.0fms",
+            w_rx_tx_ratio.mean, w_large_ratio.mean, w_jitter_ms.mean, M.get_dynamic_stall_ms()),
+        string.format("  LuaJIT Engine    : Mem=%.1f KB | Traces=%d Compiled / %d Aborted",
+            mem_kb, M.jit_stats.traces_compiled, M.jit_stats.traces_aborted),
+        string.format("  Discovered Pats  : %d | UCB1 Best Mask: %d (%s) | Endpoint: %s",
+            #discovered_patterns, a.recommended_mask, PROTO_FAMILY[a.recommended_mask] or "esp",
+            M.live.active_endpoint ~= "" and M.live.active_endpoint or "N/A"),
+    }
     if #a.anomalies == 0 then
-        print("  Anomalies        : None detected (Optimal baseline)")
+        lines[#lines + 1] = "  Anomalies        : None detected (Optimal baseline)"
     else
         for i = 1, #a.anomalies do
-            print("  ! " .. a.anomalies[i])
+            lines[#lines + 1] = "  ! " .. a.anomalies[i]
         end
     end
     local bp = M.generate_upgrade_blueprint()
     if bp[1] and bp[1].target_file ~= "none" then
-        print(string.format("  Upgrade Hint     : [%s:%s] %s", bp[1].target_file, bp[1].target_func, bp[1].proposed_change))
+        lines[#lines + 1] = string.format("  Upgrade Hint     : [%s:%s] %s", bp[1].target_file, bp[1].target_func, bp[1].proposed_change)
     end
-    print("----------------------------------------------------------------")
+    lines[#lines + 1] = "----------------------------------------------------------------"
+    local block = table.concat(lines, "\n")
+    M.log_line(block)
 end
 
 local function json_escape(str)
@@ -886,6 +934,15 @@ function M.flush_json(filepath)
     f:write("{\n")
     f:write(string.format('  "uptime_ms": %.2f,\n', M.now_ms() - start_ms))
     f:write(string.format('  "event_count": %d,\n', event_count))
+
+    f:write('  "session_meta": {\n')
+    f:write(string.format(
+        '    "engine_mode": "%s", "relay_endpoint": "%s", "target_endpoint": "%s", "warp_auto_setup": %s, "warp_mode": "%s", "migration_rule": "%s"\n',
+        json_escape(M.session_meta.engine_mode), json_escape(M.session_meta.relay_endpoint),
+        json_escape(M.session_meta.target_endpoint), tostring(M.session_meta.warp_auto_setup),
+        json_escape(M.session_meta.warp_mode), json_escape(M.session_meta.migration_rule)
+    ))
+    f:write("  },\n")
 
     f:write('  "self_identity": {\n')
     f:write(string.format('    "mission": "%s", "jit_version": "%s", "jit_enabled": %s, "boot_mem_kb": %.2f, "fixed_protos": %d\n',

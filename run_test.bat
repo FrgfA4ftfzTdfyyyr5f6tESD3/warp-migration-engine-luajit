@@ -12,5 +12,5 @@ cd /d "%~dp0"
 echo Starting Warp Migration Engine (LuaJIT 2.1 + FFI)...
 luajit.exe client.lua
 echo.
-echo Engine exited. Check telemetry.json for diagnostic flight logs.
+echo Engine exited. Check ai_report.json and wme_session.log for unified diagnostic logs.
 pause

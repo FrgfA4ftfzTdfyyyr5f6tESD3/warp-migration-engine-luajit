@@ -15,6 +15,9 @@ M.OUTBOUND_PREPEND_LEN_V6 = 28
 M.INBOUND_STRIP_LEN       = 8
 M.ADDR_TYPE_IPV4          = 0x04
 M.ADDR_TYPE_IPV6          = 0x06
+M.RELAY_SESSION_TTL_S     = 60
+M.WARP_DEFAULT_IP         = "162.159.198.2"
+M.WARP_DEFAULT_PORT       = 8095
 
 -- QUIC Packet Kinds
 M.QUIC_LONG_INITIAL   = 1
@@ -56,11 +59,18 @@ M.PROTOCOLS = {
     [17] = { id = 17, key = "discord", name = "Discord Voice & Media (Opus Audio)",       c_min = 4, c_max = 8, s_min = 60,   s_max = 160  },
 }
 
-M.TIER1_PROTO_IDS        = { 2, 3, 4, 5, 7, 10 }
 M.MASQUE_TIER1_PROTO_IDS = { 7, 10, 4, 5 }
 
 function M.get_protocol_by_id(id)
     return M.PROTOCOLS[id] or M.PROTOCOLS[7]
+end
+
+function M.format_protocol_label(id)
+    if id == 0 then
+        return "0 (auto - AI Smart UCB1 Tier-1 Rotation)"
+    end
+    local p = M.PROTOCOLS[id] or M.PROTOCOLS[7]
+    return string.format("%d (%s - %s)", p.id, p.key, p.name)
 end
 
 -- Fast xorshift32 PRNG (pure 32-bit bit ops, zero heap allocation)
@@ -118,12 +128,18 @@ local function pick_non_repeating(pool, last_id)
     return pool[(M.next_u32() % n) + 1]
 end
 
-function M.get_next_auto_proto(last_id)
-    return pick_non_repeating(M.TIER1_PROTO_IDS, last_id)
-end
-
 function M.get_next_masque_auto_proto(last_id)
     return pick_non_repeating(M.MASQUE_TIER1_PROTO_IDS, last_id)
+end
+
+-- Zero-allocation shared 16B outbound MASQUE relay envelope writer
+function M.pack_relay_env_v4(buf, off, camo_hdr, dst_ip_ptr, dst_port, proto_id)
+    ffi.copy(buf + off, camo_hdr, 8)
+    ffi.copy(buf + off + 8, dst_ip_ptr, 4)
+    buf[off + 12] = band(rshift(dst_port, 8), 0xFF)
+    buf[off + 13] = band(dst_port, 0xFF)
+    buf[off + 14] = proto_id
+    buf[off + 15] = M.ADDR_TYPE_IPV4
 end
 
 -- Helper to write big-endian u16 / u32 into uint8_t* buffer
@@ -476,7 +492,7 @@ end
 
 local CF_PORTS = {
     [8095]=true, [8595]=true, [8642]=true, [8742]=true, [8854]=true, [8886]=true, [8943]=true,
-    [443]=true,  [500]=true,  [1701]=true, [2408]=true, [4443]=true, [4500]=true, [8443]=true,
+    [443]=true,  [500]=true,  [1701]=true, [4443]=true, [4500]=true, [8443]=true,
     [5200]=true, [5201]=true, [5202]=true, [5203]=true, [5204]=true, [5205]=true,
     [7152]=true, [7156]=true, [7284]=true, [7559]=true, [7815]=true,
     [9034]=true, [9088]=true, [9389]=true, [9408]=true, [9555]=true,
@@ -528,30 +544,6 @@ function M.calc_udp_checksum_v4(buf, src_off, dst_off, udp_off, udp_len)
     return res == 0 and 0xFFFF or res
 end
 
-function M.calc_udp_checksum_v6(buf, src_off, dst_off, udp_off, udp_len)
-    local sum = 0
-    for i = 0, 14, 2 do
-        sum = sum + bor(lshift(buf[src_off + i], 8), buf[src_off + i + 1])
-        sum = sum + bor(lshift(buf[dst_off + i], 8), buf[dst_off + i + 1])
-    end
-    sum = sum + rshift(udp_len, 16) + band(udp_len, 0xFFFF) + 17
-
-    local i = 0
-    while i < udp_len do
-        if i ~= 6 then
-            local hi = buf[udp_off + i]
-            local lo = (i + 1 < udp_len) and buf[udp_off + i + 1] or 0
-            sum = sum + bor(lshift(hi, 8), lo)
-        end
-        i = i + 2
-    end
-    while rshift(sum, 16) ~= 0 do
-        sum = band(sum, 0xFFFF) + rshift(sum, 16)
-    end
-    local res = band(bnot(sum), 0xFFFF)
-    return res == 0 and 0xFFFF or res
-end
-
 -- Build raw IPv4/UDP packet into preallocated `out_buf` (uint8_t*), returns total_len
 function M.build_ipv4_udp_packet(out_buf, src_ip, dst_ip, src_port, dst_port, payload, payload_len)
     local ihl = 20
@@ -578,34 +570,34 @@ function M.build_ipv4_udp_packet(out_buf, src_ip, dst_ip, src_port, dst_port, pa
     return total_len
 end
 
-function M.build_ipv6_udp_packet(out_buf, src_ip, dst_ip, src_port, dst_port, payload, payload_len)
-    local udp_len = 8 + payload_len
-    local total_len = 40 + udp_len
-    out_buf[0] = 0x60; out_buf[1] = 0; out_buf[2] = 0; out_buf[3] = 0
-    put_be16(out_buf, 4, udp_len)
-    out_buf[6] = 17; out_buf[7] = 64
-    ffi.copy(out_buf + 8, src_ip, 16)
-    ffi.copy(out_buf + 24, dst_ip, 16)
-
-    put_be16(out_buf, 40, src_port)
-    put_be16(out_buf, 42, dst_port)
-    put_be16(out_buf, 44, udp_len)
-    out_buf[46] = 0; out_buf[47] = 0
-    if payload_len > 0 then
-        ffi.copy(out_buf + 48, payload, payload_len)
-    end
-    put_be16(out_buf, 46, M.calc_udp_checksum_v6(out_buf, 8, 24, 40, udp_len))
-    return total_len
-end
-
--- Parse IPv4/IPv6 + IP string helpers
+-- Parse IPv4 + endpoint string helpers
 function M.parse_ipv4_str(s, out_bytes)
+    if type(s) ~= "string" then return false end
+    s = s:match("^%s*(.-)%s*$")
     local a, b, c, d = s:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
     if not a then return false end
     a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
     if a > 255 or b > 255 or c > 255 or d > 255 then return false end
-    out_bytes[0] = a; out_bytes[1] = b; out_bytes[2] = c; out_bytes[3] = d
+    if out_bytes then
+        out_bytes[0] = a; out_bytes[1] = b; out_bytes[2] = c; out_bytes[3] = d
+    end
     return true
+end
+
+function M.parse_endpoint_str(s, default_port)
+    if type(s) ~= "string" then return nil, nil end
+    s = s:match("^%s*(.-)%s*$")
+    if s == "" then return nil, nil end
+    local ip, p_str = s:match("^([^:%s]+):(%d+)$")
+    local port = default_port
+    if ip then
+        port = tonumber(p_str)
+    else
+        ip = s
+    end
+    if not M.parse_ipv4_str(ip) then return nil, nil end
+    if not port or port < 1 or port > 65535 then return nil, nil end
+    return ip, port
 end
 
 function M.format_ipv4(b)

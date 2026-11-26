@@ -1,5 +1,5 @@
 -- client.lua: Windows Layer 3 Kernel Network Engine via WinDivert 2.2.2 FFI
--- Supports Mode 1 (WireGuard Direct Desync + Reverse Rekey) & Mode 2 (QUIC/MASQUE Handshake Migration).
+-- Dedicated QUIC / MASQUE Handshake Migration Engine for Cloudflare WARP (Official Client + Direct 1-RTT).
 -- Standalone execution: luajit.exe client.lua (next to WinDivert.dll and WinDivert64.sys, Run as Admin).
 
 local ffi = require("ffi")
@@ -28,14 +28,6 @@ ffi.cdef[[
     } WINDIVERT_ADDRESS;
 
     typedef struct {
-        uintptr_t Internal;
-        uintptr_t InternalHigh;
-        uint32_t  Offset;
-        uint32_t  OffsetHigh;
-        void     *hEvent;
-    } WME_OVERLAPPED;
-
-    typedef struct {
         uint16_t EventType;
         uint16_t _pad;
         union {
@@ -53,22 +45,17 @@ ffi.cdef[[
 
     void*    WinDivertOpen(const char *filter, int layer, int16_t priority, uint64_t flags);
     int      WinDivertRecv(void *handle, void *pPacket, uint32_t packetLen, uint32_t *pRecvLen, WINDIVERT_ADDRESS *pAddr);
-    int      WinDivertRecvEx(void *handle, void *pPacket, uint32_t packetLen, uint32_t *pRecvLen, uint64_t flags, WINDIVERT_ADDRESS *pAddr, uint32_t *pAddrLen, WME_OVERLAPPED *lpOverlapped);
     int      WinDivertSend(void *handle, const void *pPacket, uint32_t packetLen, uint32_t *pSendLen, const WINDIVERT_ADDRESS *pAddr);
     int      WinDivertShutdown(void *handle, int how);
     int      WinDivertClose(void *handle);
     int      WinDivertHelperCalcChecksums(void *pPacket, uint32_t packetLen, WINDIVERT_ADDRESS *pAddr, uint64_t flags);
 
     void*    GetStdHandle(uint32_t nStdHandle);
-    void*    CreateEventA(void *lpEventAttributes, int bManualReset, int bInitialState, const char *lpName);
-    int      ResetEvent(void *hEvent);
-    uint32_t WaitForMultipleObjects(uint32_t nCount, void **lpHandles, int bWaitAll, uint32_t dwMilliseconds);
-    int      GetOverlappedResult(void *hFile, WME_OVERLAPPED *lpOverlapped, uint32_t *lpNumberOfBytesTransferred, int bWait);
     int      PeekConsoleInputA(void *hConsoleInput, WME_INPUT_RECORD *lpBuffer, uint32_t nLength, uint32_t *lpNumberOfEventsRead);
     int      ReadConsoleInputA(void *hConsoleInput, WME_INPUT_RECORD *lpBuffer, uint32_t nLength, uint32_t *lpNumberOfEventsRead);
     int      GetConsoleMode(void *hConsoleHandle, uint32_t *lpMode);
     int      SetConsoleMode(void *hConsoleHandle, uint32_t dwMode);
-    int      CancelIo(void *hFile);
+    int      FlushConsoleInputBuffer(void *hConsoleInput);
     uint32_t GetLastError(void);
     void     Sleep(uint32_t dwMilliseconds);
 ]]
@@ -76,10 +63,6 @@ ffi.cdef[[
 local wd = ffi.load("WinDivert")
 local INVALID_HANDLE = ffi.cast("void*", ffi.cast("intptr_t", -1))
 local STD_INPUT_HANDLE = 0xFFFFFFF6 -- (DWORD)-10
-local ERROR_IO_PENDING = 997
-local WAIT_OBJECT_0 = 0
-local WAIT_TIMEOUT = 258
-local INFINITE = 0xFFFFFFFF
 
 local function ts_prefix()
     return os.date("[%H:%M:%S]")
@@ -93,14 +76,39 @@ local function load_config()
     local s = f:read("*a"); f:close()
     local ip = s:match('"relay_ip"%s*:%s*"([^"]+)"')
     local port = tonumber(s:match('"relay_port"%s*:%s*(%d+)'))
-    return { relay_ip = ip, relay_port = port }
+    local t_ip = s:match('"target_ip"%s*:%s*"([^"]+)"')
+    local t_port = tonumber(s:match('"target_port"%s*:%s*(%d+)'))
+    local proto = tonumber(s:match('"proto_id"%s*:%s*(%d+)'))
+    local w_mode = s:match('"warp_mode"%s*:%s*"([^"]+)"')
+    local w_cfg = s:match('"warp_configured"%s*:%s*(true|false)')
+    local w_ac  = s:match('"warp_auto_connect"%s*:%s*(true|false)')
+    return {
+        relay_ip = ip,
+        relay_port = port,
+        target_ip = t_ip,
+        target_port = t_port,
+        proto_id = proto,
+        warp_mode = w_mode,
+        warp_configured = (w_cfg == "true"),
+        warp_auto_connect = (w_ac == "true"),
+    }
 end
 
-local function save_config(ip, port)
+local function save_config(c)
     local f = io.open(CONFIG_FILE, "w")
     if not f then return end
-    f:write(string.format('{\n  "relay_ip": "%s",\n  "relay_port": %d\n}\n', ip, port))
+    f:write(string.format(
+        '{\n  "relay_ip": "%s",\n  "relay_port": %d,\n  "target_ip": "%s",\n  "target_port": %d,\n  "proto_id": %d,\n  "warp_mode": "%s",\n  "warp_configured": %s,\n  "warp_auto_connect": %s\n}\n',
+        c.relay_ip, c.relay_port, c.target_ip or "162.159.198.2", c.target_port or 8095,
+        c.proto_id or 7, c.warp_mode or "manual",
+        tostring(c.warp_configured == true), tostring(c.warp_auto_connect == true)
+    ))
     f:close()
+end
+
+local function log_msg(fmt, ...)
+    local msg = select("#", ...) > 0 and string.format(fmt, ...) or fmt
+    T.log_line(msg)
 end
 
 -- Preallocated Zero-Allocation Hot-Path Buffers
@@ -109,13 +117,11 @@ local mod_buf   = ffi.new("uint8_t[65535]")
 local lead_buf  = ffi.new("uint8_t[1500]")
 local raw_buf   = ffi.new("uint8_t[1600]")
 local camo_hdr  = ffi.new("uint8_t[8]")
+local zero_ip   = ffi.new("uint8_t[4]")
 local addr_in   = ffi.new("WINDIVERT_ADDRESS")
 local addr_tmp  = ffi.new("WINDIVERT_ADDRESS")
 local recv_len  = ffi.new("uint32_t[1]")
 local send_len  = ffi.new("uint32_t[1]")
-local addr_len  = ffi.new("uint32_t[1]")
-local ov        = ffi.new("WME_OVERLAPPED")
-local xfer_len  = ffi.new("uint32_t[1]")
 local quic_kinds = ffi.new("uint8_t[16]")
 local quic_bytes = ffi.new("uint8_t[16]")
 local con_rec   = ffi.new("WME_INPUT_RECORD[8]")
@@ -133,7 +139,7 @@ local function build_masque_filter(target_ip_str, target_port, relay_ip_str, rel
     local p_dst = string.format(
         "(udp.DstPort == 8095 or udp.DstPort == 8595 or udp.DstPort == 8642 or udp.DstPort == 8742 or " ..
         "udp.DstPort == 8854 or udp.DstPort == 8886 or udp.DstPort == 8943 or udp.DstPort == 443 or " ..
-        "udp.DstPort == 2408 or udp.DstPort == 500 or udp.DstPort == 1701 or udp.DstPort == 4443 or " ..
+        "udp.DstPort == 500 or udp.DstPort == 1701 or udp.DstPort == 4443 or " ..
         "udp.DstPort == 4500 or udp.DstPort == 8443 or (udp.DstPort >= 5200 and udp.DstPort <= 5205) or " ..
         "udp.DstPort == 7152 or udp.DstPort == 7156 or udp.DstPort == 7284 or udp.DstPort == 7559 or " ..
         "udp.DstPort == 7815 or udp.DstPort == 9034 or udp.DstPort == 9088 or udp.DstPort == 9389 or " ..
@@ -183,22 +189,37 @@ local function run_masque_engine(cfg)
     end
 
     local filter = build_masque_filter(cfg.target_ip, cfg.target_port, cfg.relay_ip, cfg.relay_port)
-    print("=========================================================================")
-    print("  WinDivert QUIC / MASQUE Engine (LuaJIT 2.1 + FFI Zero-Alloc)")
-    print("=========================================================================")
-    print(string.format("  Relay Server   : %s:%d", cfg.relay_ip, cfg.relay_port))
-    print(string.format("  Default Target : %s:%d", cfg.target_ip, cfg.target_port))
-    print(string.format("  Initial Mask   : %s", cfg.proto_id == 0 and "AUTO (Tier-1: ESP, STUN, WebRTC, DTLS)" or C.get_protocol_by_id(cfg.proto_id).name))
-    print("  Route Mode     : 1st Migration Instant Lock + Direct Wire-Speed")
-    print("  Controls       : [ENTER] Re-Arm Relay | [S] Save AI Report | [Ctrl+C] Exit")
-    print("=========================================================================\n")
+    T.init_session_log("wme_session.log")
+    T.session_meta.engine_mode     = "masque"
+    T.session_meta.relay_endpoint  = string.format("%s:%d", cfg.relay_ip, cfg.relay_port)
+    T.session_meta.target_endpoint = string.format("%s:%d", cfg.target_ip, cfg.target_port)
+    T.session_meta.warp_auto_setup = cfg.warp_auto_setup == true
+    T.session_meta.warp_mode       = cfg.warp_mode or "manual"
+    T.session_meta.migration_rule  = "BiDi-1RTT (30rx+45tx >=6.5s) / 8.5s Cap"
+
+    log_msg("=========================================================================")
+    log_msg("  WinDivert QUIC / MASQUE Engine (LuaJIT 2.1 + FFI Zero-Alloc)")
+    log_msg("=========================================================================")
+    log_msg("  Relay Server   : %s:%d", cfg.relay_ip, cfg.relay_port)
+    log_msg("  WARP Target    : %s:%d", cfg.target_ip, cfg.target_port)
+    log_msg("  WARP Mode      : %s%s", cfg.warp_mode or "manual", cfg.warp_auto_setup and " (Auto-Configured)" or "")
+    log_msg("  Initial Mask   : %s", C.format_protocol_label(cfg.proto_id))
+    log_msg("  Route Mode     : BiDi Event-Driven 1-RTT Migration + Aux Session Guard")
+    log_msg("  Unified Logs   : Console + wme_session.log + ai_report.json")
+    log_msg("  Controls       : [ENTER] Re-Arm Relay | [S] Save AI Report | [Ctrl+C] Exit")
+    log_msg("=========================================================================\n")
 
     local handle = wd.WinDivertOpen(filter, 0, 0, 0)
     if handle == INVALID_HANDLE then
-        print(string.format("[ERROR] WinDivertOpen failed (err=%d). Run as Administrator with WinDivert.dll/sys.", ffi.C.GetLastError()))
+        log_msg("[ERROR] WinDivertOpen failed (err=%d). Run as Administrator with WinDivert.dll/sys.", ffi.C.GetLastError())
+        T.close_session_log()
         return
     end
-    print("[*] WinDivert handle active. Waiting for WARP QUIC packets...")
+    log_msg("[*] WinDivert handle active. Waiting for WARP QUIC packets...")
+    if cfg.warp_auto_connect and cfg.warp_cli_bin then
+        log_msg("[*] Auto-connecting Official Cloudflare WARP client...")
+        os.execute(string.format('start "" /B "%s" connect >nul 2>&1', cfg.warp_cli_bin))
+    end
 
     T.load_mask_memory()
     T.load_evolved_policy()
@@ -220,6 +241,7 @@ local function run_masque_engine(cfg)
     local active_port = 0
     local loop_tick = 0
     local consecutive_stalls = 0
+    local hs_no_reply_cnt = 0
     local hb_last_ms = T.now_ms()
     local hb_last_tx_b, hb_last_rx_b = 0, 0
 
@@ -233,27 +255,29 @@ local function run_masque_engine(cfg)
         end
     end
 
+    local primary_ep = string.format("%s:%d", cfg.target_ip, cfg.target_port)
+
     local function handle_stall_heal(port, proto_id, reason)
         local ep = T.live.active_endpoint
-        if ep ~= "" then
+        if ep ~= "" and ep ~= primary_ep then
             local port_cooled = T.ep_mark_stalled(ep, 60000, active_port)
-            print(string.format("%s [AI ENDPOINT GUARD] Cooling down stalled %s for 60s", ts_prefix(), ep))
+            log_msg("%s [AI ENDPOINT GUARD] Cooling down stalled %s for 60s", ts_prefix(), ep)
             if port_cooled then
-                print(string.format("%s [AI PORT GUARD] Port %d stalled >=2x -> Cooling down for 120s", ts_prefix(), active_port))
+                log_msg("%s [AI PORT GUARD] Port %d stalled >=2x -> Cooling down for 120s", ts_prefix(), active_port)
             end
         end
         T.enter_phase(T.PHASE_AUTO_REARM)
         T.stat_stall(proto_id)
         if T.on_policy_stall() then
-            print(string.format("%s [AUTO-ROLLBACK] Evolved policy reverted (<1ms)", ts_prefix()))
+            log_msg("%s [AUTO-ROLLBACK] Evolved policy reverted (<1ms)", ts_prefix())
         end
         local attr, domain, pat = T.attribute_and_discover()
         local is_regime = T.check_regime_change()
         if is_regime then
-            print(string.format("%s [AI REGIME CHANGE] Multi-path degradation in <30s (%s | %s)", ts_prefix(), domain, attr))
+            log_msg("%s [AI REGIME CHANGE] Multi-path degradation in <30s (%s | %s)", ts_prefix(), domain, attr)
             local ok_syn = T.synthesize_policy_from_features()
             if ok_syn then
-                print(string.format("%s [AI POLICY SYNTH] Generated & contract-verified evolved_policy.lua", ts_prefix()))
+                log_msg("%s [AI POLICY SYNTH] Generated & contract-verified evolved_policy.lua", ts_prefix())
             end
         end
         T.record("stall_detected", port, proto_id, reason .. " | " .. domain .. " | " .. attr .. (pat and (" | " .. pat) or ""))
@@ -266,28 +290,24 @@ local function run_masque_engine(cfg)
             active_proto_id = T.pick_smart_mask(C.MASQUE_TIER1_PROTO_IDS, proto_id)
             last_auto_id = active_proto_id
             switched_id = active_proto_id
-            print(string.format("%s [AI SMART MASK] Rotating to Mask %d (%s)", ts_prefix(), active_proto_id, C.get_protocol_by_id(active_proto_id).key))
+            log_msg("%s [AI SMART MASK] Rotating to Mask %s", ts_prefix(), C.format_protocol_label(active_proto_id))
         elseif consecutive_stalls >= 2 then
             active_proto_id = T.pick_smart_mask(C.MASQUE_TIER1_PROTO_IDS, proto_id)
             consecutive_stalls = 0
             switched_id = active_proto_id
-            print(string.format("%s [AI AUTO-ESCALATE] Mask %d stalled 2x -> Switching to Mask %d (%s)",
-                ts_prefix(), proto_id, active_proto_id, C.get_protocol_by_id(active_proto_id).key))
+            log_msg("%s [AI AUTO-ESCALATE] Mask %d stalled 2x -> Switching to Mask %s",
+                ts_prefix(), proto_id, C.format_protocol_label(active_proto_id))
         end
         reset_unmigrated_timers(switched_id)
     end
 
     local function send_relay_warmup(src_ip_ptr, src_port, proto_id, base_addr)
         local pinfo = C.get_protocol_by_id(proto_id)
-        print(string.format("%s [WARMUP] Client :%d -> 2x 48B Lead-In to Relay [%s]", ts_prefix(), src_port, pinfo.key))
+        log_msg("%s [WARMUP] Client :%d -> 2x 48B Lead-In to Relay [%d:%s]", ts_prefix(), src_port, pinfo.id, pinfo.key)
         T.record("warmup_sent", src_port, proto_id, pinfo.key)
-        local zero_ip = ffi.new("uint8_t[4]")
         for i = 1, 2 do
             C.build_outbound_camo(proto_id, i, camo_hdr, 0)
-            ffi.copy(lead_buf, camo_hdr, 8)
-            ffi.copy(lead_buf + 8, zero_ip, 4)
-            C.put_be16(lead_buf, 12, 0)
-            lead_buf[14] = proto_id; lead_buf[15] = C.ADDR_TYPE_IPV4
+            C.pack_relay_env_v4(lead_buf, 0, camo_hdr, zero_ip, 0, proto_id)
             C.fill_bytes(lead_buf, 16, 32)
             local total = C.build_ipv4_udp_packet(raw_buf, src_ip_ptr, relay_ip_bytes, src_port, cfg.relay_port, lead_buf, 48)
             ffi.copy(addr_tmp, base_addr, ffi.sizeof("WINDIVERT_ADDRESS"))
@@ -300,8 +320,8 @@ local function run_masque_engine(cfg)
     local function send_direct_lead_in(src_ip_ptr, src_port, dst_ip_ptr, dst_port, proto_id, base_addr)
         local lead_proto = (proto_id == 2 or proto_id == 3) and 7 or proto_id
         local pinfo = C.get_protocol_by_id(lead_proto)
-        print(string.format("%s [LEAD-IN] Client :%d -> 2x Non-QUIC (48B/96B) [%s] -> Direct %s:%d",
-            ts_prefix(), src_port, pinfo.key, C.format_ipv4(dst_ip_ptr), dst_port))
+        log_msg("%s [LEAD-IN] Client :%d -> 2x Non-QUIC (48B/96B) [%d:%s] -> Direct %s:%d",
+            ts_prefix(), src_port, pinfo.id, pinfo.key, C.format_ipv4(dst_ip_ptr), dst_port)
         T.record("lead_in_sent", src_port, lead_proto, string.format("%s:%d", C.format_ipv4(dst_ip_ptr), dst_port))
         local ts_now = os.time()
         local sizes = { 48, 96 }
@@ -317,23 +337,27 @@ local function run_masque_engine(cfg)
         end
     end
 
+    ffi.C.FlushConsoleInputBuffer(hStdin)
     local running = true
     while running do
-        local key = check_console_key(hStdin)
-        if key == "enter" then
-            if relay_locked then
-                relay_locked = false
-                stall_tx_since_rx = 0
-                reset_unmigrated_timers()
-                print(string.format("\n%s [RELAY ARMED] Ready for next handshake migration...\n", ts_prefix()))
-                T.record("relay_rearmed", 0, 0, "User pressed Enter")
-            else
-                print(string.format("\n%s [RELAY ALREADY ARMED] Ready for handshake migration.\n", ts_prefix()))
+        loop_tick = loop_tick + 1
+        if band(loop_tick, 15) == 1 then
+            local key = check_console_key(hStdin)
+            if key == "enter" then
+                if relay_locked then
+                    relay_locked = false
+                    stall_tx_since_rx = 0
+                    reset_unmigrated_timers()
+                    log_msg("\n%s [RELAY ARMED] Ready for next handshake migration...\n", ts_prefix())
+                    T.record("relay_rearmed", 0, 0, "User pressed Enter")
+                else
+                    log_msg("\n%s [RELAY ALREADY ARMED] Ready for handshake migration.\n", ts_prefix())
+                end
+            elseif key == "snapshot" then
+                T.flush_json("ai_report.json")
+                T.print_diagnostic_summary()
+                log_msg("%s [SNAPSHOT] Saved unified AI RCA bundle to ai_report.json + wme_session.log", ts_prefix())
             end
-        elseif key == "snapshot" then
-            T.flush_json("ai_report.json")
-            T.print_diagnostic_summary()
-            print(string.format("%s [SNAPSHOT] Saved AI RCA bundle to ai_report.json", ts_prefix()))
         end
 
         local ok = wd.WinDivertRecv(handle, pkt_buf, 65535, recv_len, addr_in)
@@ -385,12 +409,14 @@ local function run_masque_engine(cfg)
                         stall_tx_start_ms = T.now_ms()
                     end
                     stall_tx_since_rx = stall_tx_since_rx + 1
+                    local now_s = T.now_ms()
                     local dyn_stall = T.get_dynamic_stall_ms()
-                    if relay_locked and stall_tx_since_rx >= 6 and (T.now_ms() - stall_tx_start_ms) >= dyn_stall then
-                        print(string.format("%s [STALL DETECTED] No RX for %.1fs (%d TX pkts). Auto Re-Arming...", ts_prefix(), dyn_stall / 1000.0, stall_tx_since_rx))
+                    local eff_stall = (now_s - lock_time_ms < 14000) and math.max(dyn_stall, 11000) or dyn_stall
+                    if relay_locked and stall_tx_since_rx >= 3 and (now_s - stall_tx_start_ms) >= eff_stall then
+                        log_msg("%s [STALL DETECTED] No RX for %.1fs (%d TX pkts). Auto Re-Arming...", ts_prefix(), eff_stall / 1000.0, stall_tx_since_rx)
                         handle_stall_heal(src_port, sess.proto_id, "Dynamic RX stall -> Auto Re-Arm")
                     end
-                    -- Live 15s Throughput Heartbeat + 15s Evolved Policy Check
+                    -- Live 15s Throughput Heartbeat + 15s Evolved Policy Check + Idle Session GC
                     local hb_now = T.now_ms()
                     if hb_now - hb_last_ms >= 15000 and T.live.direct_rx_pkts > 0 then
                         local dt_s = (hb_now - hb_last_ms) / 1000.0
@@ -399,11 +425,14 @@ local function run_masque_engine(cfg)
                         hb_last_ms = hb_now
                         hb_last_tx_b = T.live.direct_tx_bytes
                         hb_last_rx_b = T.live.direct_rx_bytes
-                        print(string.format("%s [LIVE AI] %s | TX: %.1f KB/s | RX: %.1f KB/s | Pkts: %d/%d",
-                            ts_prefix(), T.live.active_endpoint, tx_kbs, rx_kbs, T.live.direct_tx_pkts, T.live.direct_rx_pkts))
+                        log_msg("%s [LIVE AI] %s | TX: %.1f KB/s | RX: %.1f KB/s | Pkts: %d/%d",
+                            ts_prefix(), T.live.active_endpoint, tx_kbs, rx_kbs, T.live.direct_tx_pkts, T.live.direct_rx_pkts)
+                        for kp, sp in pairs(sessions) do
+                            if not sp.migrated and (hb_now - sp.start_ms) > 180000 then sessions[kp] = nil end
+                        end
                         local pol_act = T.eval_evolved_policy()
                         if pol_act and pol_act.action == "DIVERSE_SWITCH" then
-                            print(string.format("%s [EVOLVED POLICY] Pre-emptive diverse switch triggered!", ts_prefix()))
+                            log_msg("%s [EVOLVED POLICY] Pre-emptive diverse switch triggered!", ts_prefix())
                             handle_stall_heal(src_port, sess.proto_id, "Evolved policy pre-emptive switch")
                         end
                     end
@@ -428,6 +457,11 @@ local function run_masque_engine(cfg)
                         ep_str = ep_str,
                         proto_id = chosen,
                         migrated = false,
+                        aux_allowed = false,
+                        hs_confirmed = false,
+                        hs_confirmed_ms = 0,
+                        post_hs_1rtt = 0,
+                        srv_1rtt = 0,
                         short_1rtt = 0,
                         srv_hs = 0,
                         warmup_done = false,
@@ -444,22 +478,42 @@ local function run_masque_engine(cfg)
                 local needs_warmup = (qkind == C.QUIC_LONG_INITIAL and not sess.warmup_done)
                 if needs_warmup then sess.warmup_done = true end
 
-                -- State machine
+                -- State machine (BiDi Event-Driven 1-RTT Migration + Safety Cap)
                 local action = "relay"
+                local is_primary_mig = false
+                local mig_reason = nil
                 if qkind == C.QUIC_LONG_INITIAL then
                     if sess.migrated then
-                        -- Genuine reconnect on a reused port: reset session state
-                        sess.migrated = false; sess.short_1rtt = 0; sess.srv_hs = 0
+                        -- Genuine reconnect on a reused port: reset session state cleanly
+                        sess.migrated = false; sess.hs_confirmed = false; sess.hs_confirmed_ms = 0
+                        sess.post_hs_1rtt = 0; sess.srv_1rtt = 0
+                        sess.short_1rtt = 0; sess.srv_hs = 0
+                        sess.warmup_done = true
+                        needs_warmup = true
                         sess.start_ms = T.now_ms()
                     end
                     action = "relay"
                 elseif sess.migrated then
                     action = "direct"
                 elseif qkind == C.QUIC_SHORT_1RTT then
-                    sess.short_1rtt = sess.short_1rtt + 1
-                    if sess.short_1rtt >= 20 then
-                        sess.migrated = true
-                        action = "trigger_migration"
+                    if sess.hs_confirmed then
+                        sess.post_hs_1rtt = sess.post_hs_1rtt + 1
+                        local elapsed_hs = T.now_ms() - sess.hs_confirmed_ms
+                        local bidi_ready = (sess.srv_1rtt >= 30 and sess.post_hs_1rtt >= 45 and elapsed_hs >= 6500)
+                        local cap_ready  = (sess.post_hs_1rtt >= 60 and elapsed_hs >= 8500) or sess.post_hs_1rtt >= 180
+                        if bidi_ready or cap_ready then
+                            sess.migrated = true
+                            is_primary_mig = true
+                            action = "trigger_migration"
+                            mig_reason = bidi_ready and string.format("BiDi 1-RTT (%dtx/%drx)", sess.post_hs_1rtt, sess.srv_1rtt) or "8.5s/180p Cap"
+                        end
+                    else
+                        sess.short_1rtt = sess.short_1rtt + 1
+                        if sess.short_1rtt >= 20 then
+                            sess.migrated = true
+                            action = "trigger_migration"
+                            mig_reason = "Backup 20 Pkts"
+                        end
                     end
                 end
 
@@ -469,22 +523,38 @@ local function run_masque_engine(cfg)
                     local no_rx_since_lock = (T.live.direct_rx_pkts == rx_at_lock) and (lock_age >= 2800)
                     local rx_timed_out     = (lock_age >= 2800) and (last_direct_rx_ms > 0) and ((now_t - last_direct_rx_ms) >= 3500)
                     if qkind == C.QUIC_LONG_INITIAL and (no_rx_since_lock or rx_timed_out) then
-                        print(string.format("\n%s [AUTO RE-ARM] Previous tunnel inactive. Re-arming for Client :%d...", ts_prefix(), src_port))
+                        log_msg("\n%s [AUTO RE-ARM] Previous tunnel inactive. Re-arming for Client :%d...", ts_prefix(), src_port)
                         handle_stall_heal(src_port, sess.proto_id, "WARP reconnect + dead direct path -> Auto Re-Arm")
+                    elseif qkind == C.QUIC_LONG_INITIAL and lock_age >= 2000 then
+                        if not sess.aux_allowed then
+                            sess.aux_allowed = true
+                            if not sess.warmup_done then sess.warmup_done = true; needs_warmup = true end
+                            log_msg("%s [AUX SESSION] Client :%d -> New Initial while tunnel active; routing via Relay", ts_prefix(), src_port)
+                        end
+                    elseif sess.aux_allowed then
+                        -- Auxiliary session in handshake/grace window: allow via Relay
                     else
                         T.ring_push(5, src_port, pay_len, qkind, 2)
                         T.record("verdict_drop", src_port, sess.proto_id, "Relay locked, dropped unmigrated pkt")
                         T.stat_drop(sess.proto_id)
                         goto continue_loop -- VERDICT_DROP
                     end
-                elseif action == "relay" and T.ep_is_cooled_down(sess.ep_str, dst_port) then
-                    -- Endpoint & Port Guard: drop stalled Cloudflare IP/port during handshake race
+                elseif action == "relay" and sess.ep_str ~= primary_ep and T.ep_is_cooled_down(sess.ep_str, dst_port) then
+                    -- Endpoint & Port Guard: drop stalled alternate Cloudflare IP/port (never blackhole the primary configured endpoint)
                     T.ring_push(5, src_port, pay_len, qkind, 3)
                     T.stat_drop(sess.proto_id)
                     goto continue_loop
                 end
 
-                if needs_warmup and not relay_locked then
+                if needs_warmup and (not relay_locked or sess.aux_allowed) then
+                    hs_no_reply_cnt = hs_no_reply_cnt + 1
+                    if hs_no_reply_cnt >= 4 then
+                        hs_no_reply_cnt = 0
+                        active_proto_id = T.pick_smart_mask(C.MASQUE_TIER1_PROTO_IDS, sess.proto_id)
+                        sess.proto_id = active_proto_id
+                        log_msg("%s [AI HANDSHAKE ESCALATE] 4x no-reply -> Switching to Mask %s",
+                            ts_prefix(), C.format_protocol_label(active_proto_id))
+                    end
                     T.enter_phase(T.PHASE_WARMUP)
                     send_relay_warmup(pkt_buf + 12, src_port, sess.proto_id, addr_in)
                     T.enter_phase(T.PHASE_HANDSHAKE)
@@ -494,20 +564,21 @@ local function run_masque_engine(cfg)
                     T.enter_phase(T.PHASE_MIGRATION)
                     send_direct_lead_in(pkt_buf + 12, src_port, dst_ip_ptr, dst_port, sess.proto_id, addr_in)
                     local dt = T.now_ms() - sess.start_ms
-                    T.stat_migrated(sess.proto_id, dt, false)
-                    T.record("migration_triggered", src_port, sess.proto_id, "Backup 20x 1-RTT cushion", dt)
-                    print(string.format("%s [MIGRATED -> DIRECT] Client :%d -> %s:%d (Backup 20 Pkts, %.1fms)",
-                        ts_prefix(), src_port, C.format_ipv4(dst_ip_ptr), dst_port, dt))
+                    T.stat_migrated(sess.proto_id, dt, is_primary_mig)
+                    local trig_lbl = mig_reason or (is_primary_mig and "2nd Server Handshake + BiDi 1-RTT" or "Backup 20 Pkts")
+                    T.record("migration_triggered", src_port, sess.proto_id, trig_lbl, dt)
+                    log_msg("%s [MIGRATED -> DIRECT] Client :%d -> %s:%d (%s, %.1fms)",
+                        ts_prefix(), src_port, C.format_ipv4(dst_ip_ptr), dst_port, trig_lbl, dt)
                     if not relay_locked then
                         relay_locked = true
                         lock_time_ms = T.now_ms()
                         rx_at_lock   = T.live.direct_rx_pkts
                         stall_tx_since_rx = 0
-                        active_port = rest_port
+                        active_port = dst_port
                         T.live.active_endpoint = sess.ep_str
                         T.ep_mark_migrated(sess.ep_str)
-                        print(string.format("%s [RELAY LOCKED] 1st session migrated. Press [ENTER] to re-arm...", ts_prefix()))
-                        T.record("relay_locked", src_port, sess.proto_id, "Backup trigger")
+                        log_msg("%s [RELAY LOCKED] 1st session migrated. Press [ENTER] to re-arm...", ts_prefix())
+                        T.record("relay_locked", src_port, sess.proto_id, trig_lbl)
                         T.flush_json("ai_report.json")
                         T.print_diagnostic_summary()
                     end
@@ -517,18 +588,14 @@ local function run_masque_engine(cfg)
                     wd.WinDivertHelperCalcChecksums(pkt_buf, nbytes, addr_in, 0)
                     wd.WinDivertSend(handle, pkt_buf, nbytes, send_len, addr_in)
                 else
-                    -- Prepend 16B envelope into mod_buf (zero allocation)
-                    local new_pay_len = pay_len + 16
-                    local new_total   = nbytes + 16
+                    -- Prepend 16B envelope into mod_buf via shared common.lua helper (zero allocation)
+                    local new_pay_len = pay_len + C.OUTBOUND_PREPEND_LEN_V4
+                    local new_total   = nbytes + C.OUTBOUND_PREPEND_LEN_V4
                     ffi.copy(mod_buf, pkt_buf, pay_off)
-                    ffi.copy(mod_buf + pay_off + 16, pkt_buf + pay_off, pay_len)
+                    ffi.copy(mod_buf + pay_off + C.OUTBOUND_PREPEND_LEN_V4, pkt_buf + pay_off, pay_len)
                     C.build_outbound_camo(sess.proto_id, out_seq, camo_hdr, 0)
                     out_seq = out_seq + 1
-                    ffi.copy(mod_buf + pay_off, camo_hdr, 8)
-                    ffi.copy(mod_buf + pay_off + 8, dst_ip_ptr, 4)
-                    C.put_be16(mod_buf, pay_off + 12, dst_port)
-                    mod_buf[pay_off + 14] = sess.proto_id
-                    mod_buf[pay_off + 15] = C.ADDR_TYPE_IPV4
+                    C.pack_relay_env_v4(mod_buf, pay_off, camo_hdr, dst_ip_ptr, dst_port, sess.proto_id)
 
                     C.put_be16(mod_buf, 2, ihl + 8 + new_pay_len)
                     ffi.copy(mod_buf + 16, relay_ip_bytes, 4)
@@ -539,13 +606,13 @@ local function run_masque_engine(cfg)
                     T.ring_push(1, src_port, pay_len, qkind, 0)
                     local pspec = C.get_protocol_by_id(sess.proto_id)
                     if qkind == C.QUIC_LONG_INITIAL and (out_count <= 2 or out_count % 10 == 0) then
-                        print(string.format("%s [HANDSHAKE] Client :%d -> Initial (%dB) [%s] -> Relay", ts_prefix(), src_port, pay_len, pspec.key))
+                        log_msg("%s [HANDSHAKE] Client :%d -> Initial (%dB) [%d:%s] -> Relay", ts_prefix(), src_port, pay_len, pspec.id, pspec.key)
                         T.record("handshake_pkt", src_port, sess.proto_id, string.format("OUT Initial %dB", pay_len))
                     elseif qkind == C.QUIC_LONG_HANDSHAKE then
-                        print(string.format("%s [HANDSHAKE] Client :%d -> Handshake (%dB) [%s] -> Relay", ts_prefix(), src_port, pay_len, pspec.key))
+                        log_msg("%s [HANDSHAKE] Client :%d -> Handshake (%dB) [%d:%s] -> Relay", ts_prefix(), src_port, pay_len, pspec.id, pspec.key)
                         T.record("handshake_pkt", src_port, sess.proto_id, string.format("OUT Handshake %dB", pay_len))
                     elseif qkind == C.QUIC_SHORT_1RTT and (sess.short_1rtt == 1 or sess.short_1rtt == 10 or sess.short_1rtt == 19) then
-                        print(string.format("%s [1-RTT TRANSIT] Client :%d -> Packet %d/20 via Relay", ts_prefix(), src_port, sess.short_1rtt))
+                        log_msg("%s [1-RTT TRANSIT] Client :%d -> Packet %d/20 via Relay", ts_prefix(), src_port, sess.short_1rtt)
                         T.record("handshake_pkt", src_port, sess.proto_id, string.format("OUT 1-RTT %d/20", sess.short_1rtt))
                     end
 
@@ -562,10 +629,11 @@ local function run_masque_engine(cfg)
                 and src_port == cfg.relay_port)
 
             if from_relay and pay_len >= 8 then
+                hs_no_reply_cnt = 0
                 in_count = in_count + 1
                 local sess = sessions[dst_port]
                 -- Silently drop leftover relay packets for losing parallel ports after RELAY LOCKED
-                if relay_locked and (not sess or not sess.migrated) then
+                if relay_locked and (not sess or (not sess.migrated and not sess.aux_allowed)) then
                     T.stat_drop(sess and sess.proto_id or active_proto_id)
                     goto continue_loop
                 end
@@ -586,46 +654,39 @@ local function run_masque_engine(cfg)
                 local qcount = C.inspect_all_quic_packets(mod_buf, pay_off, new_pay_len, quic_kinds, quic_bytes)
                 T.ring_push(2, dst_port, new_pay_len, quic_kinds[1], 0)
                 local hs_count = 0
+                local rtt1_count = 0
                 for qi = 1, qcount do
                     local k = quic_kinds[qi]
                     local kname = C.QUIC_KIND_NAMES[k] or "QUIC"
                     if k == C.QUIC_LONG_INITIAL or k == C.QUIC_LONG_RETRY or k == C.QUIC_LONG_HANDSHAKE then
-                        print(string.format("%s [HANDSHAKE] Relay -> Stripped [%s (0x%02x)] -> Client :%d", ts_prefix(), kname, quic_bytes[qi], dst_port))
+                        log_msg("%s [HANDSHAKE] Relay -> Stripped [%s (0x%02x)] -> Client :%d", ts_prefix(), kname, quic_bytes[qi], dst_port)
                         T.record("quic_coalesced", dst_port, locked_proto, string.format("IN %s (0x%02x)", kname, quic_bytes[qi]))
                     end
                     if k == C.QUIC_LONG_HANDSHAKE then hs_count = hs_count + 1 end
+                    if k == C.QUIC_SHORT_1RTT then rtt1_count = rtt1_count + 1 end
                 end
 
-                if hs_count > 0 and not relay_locked and sess and not sess.migrated then
+                if sess and hs_count > 0 and (not relay_locked or sess.aux_allowed) and not sess.migrated and not sess.hs_confirmed then
                     sess.srv_hs = sess.srv_hs + hs_count
                     if sess.srv_hs >= 2 then
-                        sess.migrated = true
-                        T.enter_phase(T.PHASE_MIGRATION)
-                        send_direct_lead_in(pkt_buf + 16, dst_port, rest_ip, rest_port, locked_proto, addr_in)
-                        local dt = T.now_ms() - sess.start_ms
-                        T.stat_migrated(locked_proto, dt, true)
-                        T.record("migration_triggered", dst_port, locked_proto, "Primary 2nd Server Handshake", dt)
-                        print(string.format("%s [MIGRATED -> DIRECT] Client :%d -> %s:%d (2nd Server Handshake, %.1fms)",
-                            ts_prefix(), dst_port, C.format_ipv4(rest_ip), rest_port, dt))
-                        relay_locked = true
-                        lock_time_ms = T.now_ms()
-                        rx_at_lock   = T.live.direct_rx_pkts
-                        stall_tx_since_rx = 0
-                        active_port = rest_port
-                        T.live.active_endpoint = sess.ep_str
-                        T.ep_mark_migrated(sess.ep_str)
-                        print(string.format("%s [RELAY LOCKED] 1st session migrated. Press [ENTER] to re-arm...", ts_prefix()))
-                        T.record("relay_locked", dst_port, locked_proto, "Primary trigger")
-                        T.flush_json("ai_report.json")
-                        T.print_diagnostic_summary()
+                        sess.hs_confirmed = true
+                        sess.hs_confirmed_ms = T.now_ms()
+                        sess.post_hs_1rtt = 0
+                        sess.srv_1rtt = 0
+                        log_msg("%s [HS CONFIRMED] Client :%d -> 2nd Server Handshake (BiDi 1-RTT event-driven grace)", ts_prefix(), dst_port)
                     end
+                elseif rtt1_count > 0 and sess and sess.hs_confirmed and not sess.migrated then
+                    sess.srv_1rtt = sess.srv_1rtt + rtt1_count
                 end
 
                 wd.WinDivertHelperCalcChecksums(mod_buf, new_total, addr_in, 0)
                 if cfg.zero_csum then mod_buf[udp_off + 6] = 0; mod_buf[udp_off + 7] = 0 end
                 wd.WinDivertSend(handle, mod_buf, new_total, send_len, addr_in)
                 goto continue_loop
-            elseif C.is_cloudflare_ip_v4(src_ip_ptr[0], src_ip_ptr[1], src_ip_ptr[2]) and (C.is_cloudflare_port(src_port) or src_port == cfg.target_port) then
+            elseif (C.is_cloudflare_ip_v4(src_ip_ptr[0], src_ip_ptr[1], src_ip_ptr[2])
+                or (src_ip_ptr[0] == target_ip_bytes[0] and src_ip_ptr[1] == target_ip_bytes[1]
+                    and src_ip_ptr[2] == target_ip_bytes[2] and src_ip_ptr[3] == target_ip_bytes[3]))
+                and (C.is_cloudflare_port(src_port) or src_port == cfg.target_port) then
                 -- Direct 1-RTT inbound from Cloudflare
                 T.enter_phase(T.PHASE_DIRECT_1RTT)
                 T.live.direct_rx_pkts  = T.live.direct_rx_pkts + 1
@@ -649,283 +710,215 @@ local function run_masque_engine(cfg)
     wd.WinDivertShutdown(handle, 3)
     wd.WinDivertClose(handle)
     T.flush_json("ai_report.json")
-    print("[*] AI RCA bundle saved to ai_report.json. MASQUE engine shut down cleanly.")
+    log_msg("[*] Unified AI RCA saved to ai_report.json + wme_session.log. MASQUE engine shut down cleanly.")
+    T.close_session_log()
 end
 
 -- =========================================================================
--- MODE 1: DIRECT RELAYLESS WIREGUARD ENGINE (Stateful CPS + Role Swap)
--- =========================================================================
-local function run_wireguard_engine(cfg)
-    local filter = "(udp.PayloadLength == 148 and udp.Payload32[0] == 0x01000000) or (udp.PayloadLength == 92 and udp.Payload32[0] == 0x02000000)"
-    print("=========================================================================")
-    print("  WireGuard / UDP Direct Desync Engine (LuaJIT 2.1 + FFI)")
-    print("=========================================================================")
-    print(string.format("  Reverse Rekey : %s", cfg.reverse_rekey and "ENABLED (Noise_IK Role Swap)" or "DISABLED"))
-    print(string.format("  Initial Mode  : %s", cfg.proto_id == 0 and "AUTO (Tier-1)" or C.get_protocol_by_id(cfg.proto_id).name))
-    print("  Controls      : [Ctrl+C] Flush Telemetry & Exit")
-    print("=========================================================================\n")
-
-    local handle = wd.WinDivertOpen(filter, 0, 0, 0)
-    if handle == INVALID_HANDLE then
-        print(string.format("[ERROR] WinDivertOpen failed (err=%d). Run as Administrator.", ffi.C.GetLastError()))
-        return
-    end
-
-    local hStdin = ffi.C.GetStdHandle(STD_INPUT_HANDLE)
-    local old_mode = ffi.new("uint32_t[1]")
-    ffi.C.GetConsoleMode(hStdin, old_mode)
-    ffi.C.SetConsoleMode(hStdin, band(old_mode[0], bit.bnot(0x0019)))
-    ov.hEvent = ffi.C.CreateEventA(nil, 1, 0, nil)
-    local wait_handles = ffi.new("void*[2]", { ov.hEvent, hStdin })
-    local wg_pending = false
-
-    local flows = {} -- flow_key -> { state="tried"|"est", last_ms, est_ms, rev_status, rev_sup_ms, rev_sup_cnt }
-    local trails = {} -- non-blocking scheduled trail packets { due_ms, addr, pkt_copy, len, label }
-    local last_auto_id = nil
-    local hs_counter = 0
-
-    local running = true
-    while running do
-        -- Dispatch any due trail packets
-        local now = T.now_ms()
-        local i = 1
-        while i <= #trails do
-            if now >= trails[i].due_ms then
-                local tr = table.remove(trails, i)
-                wd.WinDivertHelperCalcChecksums(tr.pkt, tr.len, tr.addr, 0)
-                wd.WinDivertSend(handle, tr.pkt, tr.len, send_len, tr.addr)
-                print(string.format("    [%s] -> Size: %4d B [SENT]", tr.label, tr.len))
-            else
-                i = i + 1
-            end
-        end
-
-        local timeout_ms = INFINITE
-        if #trails > 0 then
-            local min_due = trails[1].due_ms
-            for j = 2, #trails do if trails[j].due_ms < min_due then min_due = trails[j].due_ms end end
-            local diff = math.floor(min_due - T.now_ms())
-            timeout_ms = diff > 0 and diff or 0
-        end
-
-        local nbytes = 0
-        if not wg_pending then
-            ffi.C.ResetEvent(ov.hEvent)
-            ov.Internal = 0; ov.InternalHigh = 0; ov.Offset = 0; ov.OffsetHigh = 0
-            addr_len[0] = ffi.sizeof("WINDIVERT_ADDRESS")
-            local ok = wd.WinDivertRecvEx(handle, pkt_buf, 65535, recv_len, 0, addr_in, addr_len, ov)
-            if ok ~= 0 then
-                nbytes = recv_len[0]
-            else
-                if ffi.C.GetLastError() ~= ERROR_IO_PENDING then break end
-                wg_pending = true
-            end
-        end
-        if wg_pending then
-            local w = ffi.C.WaitForMultipleObjects(2, wait_handles, 0, timeout_ms)
-            if w == WAIT_OBJECT_0 then
-                wg_pending = false
-                if ffi.C.GetOverlappedResult(handle, ov, xfer_len, 1) ~= 0 then nbytes = xfer_len[0] end
-            elseif w == WAIT_TIMEOUT then
-                nbytes = 0
-            elseif w == WAIT_OBJECT_0 + 1 then
-                if check_console_key(hStdin) == "ctrl_c" then running = false end
-                nbytes = 0
-            end
-        end
-
-        if not running then break end
-        if nbytes == 0 then goto wg_continue end
-
-        local ver = bit.rshift(pkt_buf[0], 4)
-        local ihl = (ver == 4) and (band(pkt_buf[0], 0x0F) * 4) or 40
-        local proto = (ver == 4) and pkt_buf[9] or pkt_buf[6]
-        if proto ~= 17 or nbytes < ihl + 8 then
-            wd.WinDivertSend(handle, pkt_buf, nbytes, send_len, addr_in)
-            goto wg_continue
-        end
-
-        local src_port = C.get_be16(pkt_buf, ihl)
-        local dst_port = C.get_be16(pkt_buf, ihl + 2)
-        local udp_len  = C.get_be16(pkt_buf, ihl + 4)
-        local pay_off  = ihl + 8
-        local pay_len  = udp_len - 8
-        if udp_len < 8 or nbytes < ihl + udp_len then
-            wd.WinDivertSend(handle, pkt_buf, nbytes, send_len, addr_in)
-            goto wg_continue
-        end
-        local fkey = (addr_in.Outbound == 1)
-            and string.format("%d->%d", src_port, dst_port)
-            or  string.format("%d->%d", dst_port, src_port)
-
-        local is_type1 = (pay_len == 148 and pkt_buf[pay_off] == 1 and pkt_buf[pay_off+1] == 0 and pkt_buf[pay_off+2] == 0 and pkt_buf[pay_off+3] == 0)
-        local is_type2 = (pay_len == 92  and pkt_buf[pay_off] == 2 and pkt_buf[pay_off+1] == 0 and pkt_buf[pay_off+2] == 0 and pkt_buf[pay_off+3] == 0)
-
-        if addr_in.Outbound == 0 then
-            if is_type2 then
-                local ent = flows[fkey] or {}
-                ent.state = "est"; ent.est_ms = T.now_ms(); ent.last_ms = ent.est_ms
-                ent.rev_status = ent.rev_status or "init"
-                flows[fkey] = ent
-                print(string.format("%s [WG ESTABLISHED] Flow %s Type 2 (92B) received!", ts_prefix(), fkey))
-                T.record("wg_established", src_port, 0, fkey)
-            elseif is_type1 and cfg.reverse_rekey then
-                local ent = flows[fkey]
-                if ent and ent.rev_status ~= "done" then
-                    ent.rev_status = "srv_init"
-                    print(string.format("%s [REVERSE REKEY] Server Type 1 (148B) received on %s!", ts_prefix(), fkey))
-                    T.record("wg_reverse_rekey_swap", src_port, 0, fkey)
-                end
-            end
-            wd.WinDivertSend(handle, pkt_buf, nbytes, send_len, addr_in)
-            goto wg_continue
-        end
-
-        -- Outbound
-        if is_type2 and cfg.reverse_rekey then
-            local ent = flows[fkey]
-            if ent and ent.rev_status == "srv_init" then
-                ent.rev_status = "done"
-                print(string.format("%s [REVERSE REKEY] Role Swap LOCKED on %s!", ts_prefix(), fkey))
-            end
-            wd.WinDivertSend(handle, pkt_buf, nbytes, send_len, addr_in)
-            goto wg_continue
-        end
-
-        if is_type1 then
-            local ent = flows[fkey]
-            if ent and ent.state == "est" then
-                if cfg.reverse_rekey and ent.rev_status ~= "done" and ent.rev_status ~= "fallback" then
-                    local age_s = (T.now_ms() - ent.est_ms) / 1000.0
-                    if ent.rev_status == "init" then
-                        ent.rev_status = "suppressing"; ent.rev_sup_ms = T.now_ms(); ent.rev_sup_cnt = 1
-                        print(string.format("%s [REVERSE REKEY] Client Rekey Suppressed (age=%.1fs)", ts_prefix(), age_s))
-                        T.record("wg_reverse_rekey_suppress", src_port, 0, fkey)
-                        goto wg_continue -- Drop
-                    elseif ent.rev_status == "suppressing" then
-                        local sup_s = (T.now_ms() - ent.rev_sup_ms) / 1000.0
-                        if age_s > 220.0 or sup_s > 95.0 then
-                            ent.rev_status = "fallback"
-                            print(string.format("%s [REVERSE REKEY] Safety Fallback -> Passing Rekey", ts_prefix()))
-                            T.record("wg_reverse_rekey_fallback", src_port, 0, fkey)
-                        else
-                            ent.rev_sup_cnt = ent.rev_sup_cnt + 1
-                            goto wg_continue -- Drop
-                        end
-                    end
-                end
-                wd.WinDivertSend(handle, pkt_buf, nbytes, send_len, addr_in)
-                goto wg_continue
-            elseif ent and ent.state == "tried" then
-                print(string.format("%s [DUPLICATE DROPPED] Flow %s -> forcing port rotation", ts_prefix(), fkey))
-                T.record("wg_duplicate_drop", src_port, 0, fkey)
-                goto wg_continue -- VERDICT_DROP
-            end
-
-            -- Fresh flow
-            hs_counter = hs_counter + 1
-            flows[fkey] = { state = "tried", last_ms = T.now_ms(), rev_status = "init" }
-            local pid = cfg.proto_id
-            if pid == 0 then pid = C.get_next_auto_proto(last_auto_id); last_auto_id = pid end
-            local spec = C.get_protocol_by_id(pid)
-            local jc = spec.c_min + (C.next_u32() % (spec.c_max - spec.c_min + 1))
-            local iv_ms = math.floor((1800 + (C.next_u32() % 600)) / jc)
-            print(string.format("%s [WG HANDSHAKE #%d] Flow %s | Mask: %s | Lead-In x%d", ts_prefix(), hs_counter, fkey, spec.key, jc))
-            T.record("wg_handshake", src_port, pid, fkey)
-
-            local ts_now = os.time()
-            for i = 1, jc do
-                local sz = spec.s_min + (C.next_u32() % (spec.s_max - spec.s_min + 1))
-                C.build_lead_payload(pid, sz, i, ts_now, ts_now, lead_buf)
-                local total = (ver == 4)
-                    and C.build_ipv4_udp_packet(raw_buf, pkt_buf+12, pkt_buf+16, src_port, dst_port, lead_buf, sz)
-                    or  C.build_ipv6_udp_packet(raw_buf, pkt_buf+8,  pkt_buf+24, src_port, dst_port, lead_buf, sz)
-                wd.WinDivertHelperCalcChecksums(raw_buf, total, addr_in, 0)
-                wd.WinDivertSend(handle, raw_buf, total, send_len, addr_in)
-                ffi.C.Sleep(iv_ms)
-            end
-
-            -- Release 148B Type 1
-            wd.WinDivertSend(handle, pkt_buf, nbytes, send_len, addr_in)
-            print("    [HANDSHAKE] -> Size: 148 B [PASSED]")
-
-            -- Schedule Dual Trail (+60ms, +180ms)
-            local base_t = T.now_ms()
-            for t_idx, delay in ipairs({ 60, 180 }) do
-                local sz = spec.s_min + (C.next_u32() % (spec.s_max - spec.s_min + 1))
-                C.build_lead_payload(pid, sz, jc + t_idx, os.time(), os.time(), lead_buf)
-                local tbuf = ffi.new("uint8_t[1600]")
-                local tlen = (ver == 4)
-                    and C.build_ipv4_udp_packet(tbuf, pkt_buf+12, pkt_buf+16, src_port, dst_port, lead_buf, sz)
-                    or  C.build_ipv6_udp_packet(tbuf, pkt_buf+8,  pkt_buf+24, src_port, dst_port, lead_buf, sz)
-                local taddr = ffi.new("WINDIVERT_ADDRESS")
-                ffi.copy(taddr, addr_in, ffi.sizeof("WINDIVERT_ADDRESS"))
-                trails[#trails + 1] = { due_ms = base_t + delay, pkt = tbuf, len = tlen, addr = taddr, label = "TRAIL " .. t_idx .. "/2" }
-            end
-            goto wg_continue
-        end
-
-        wd.WinDivertSend(handle, pkt_buf, nbytes, send_len, addr_in)
-        ::wg_continue::
-    end
-
-    ffi.C.SetConsoleMode(hStdin, old_mode[0])
-    ffi.C.SetConsoleMode(hStdin, old_mode[0])
-    wd.WinDivertShutdown(handle, 3)
-    wd.WinDivertClose(handle)
-    T.flush_json("telemetry.json")
-    print("[*] Telemetry saved to telemetry.json. WireGuard engine shut down cleanly.")
-end
-
--- =========================================================================
--- CLI ENTRYPOINT
+-- CLI ENTRYPOINT & OFFICIAL CLOUDFLARE WARP AUTO-CONFIG
 -- =========================================================================
 local function prompt(msg)
     io.write(msg); io.flush()
     return (io.read("*l") or ""):match("^%s*(.-)%s*$")
 end
 
+local function print_all_protocols()
+    print("\n  Camouflage Protocols (17 L4 Masks + AI Auto):")
+    print("    [ 0] auto     - AI Smart Auto-Rotation (Discounted UCB1 Tier-1 Masks)")
+    for id = 1, 17 do
+        local p = C.PROTOCOLS[id]
+        local tag = (id == 7 or id == 10 or id == 4 or id == 5) and " *Tier-1*" or ""
+        print(string.format("    [%2d] %-8s - %s%s", p.id, p.key, p.name, tag))
+    end
+end
+
+local function find_warp_cli()
+    local std_path = [[C:\Program Files\Cloudflare\Cloudflare WARP\warp-cli.exe]]
+    local f = io.open(std_path, "rb")
+    if f then f:close(); return std_path end
+    local p = io.popen("where warp-cli 2>nul")
+    if p then
+        local out = (p:read("*l") or ""):match("^%s*(.-)%s*$")
+        p:close()
+        if out ~= "" then return out end
+    end
+    return nil
+end
+
+local function exec_warp_cli(warp_bin, args)
+    local cmd = string.format('""%s" %s 2>&1"', warp_bin, args)
+    local p = io.popen(cmd)
+    if not p then return false, "popen_failed" end
+    local out = (p:read("*a") or ""):match("^%s*(.-)%s*$")
+    local ok = p:close()
+    return ok == true or ok == 0, out
+end
+
+local function configure_official_warp(relay_ip, target_ip, target_port, warp_mode)
+    local warp_bin = find_warp_cli()
+    if not warp_bin then
+        print("[WARN] warp-cli.exe not found in C:\\Program Files\\Cloudflare\\Cloudflare WARP\\ or PATH.")
+        return false, nil
+    end
+
+    print(string.format("\n[*] Configuring Official Cloudflare WARP (%s)...", warp_bin))
+    local steps = {
+        { args = "disconnect",                                           label = "Disconnect active session" },
+        { args = "mode " .. warp_mode,                                   label = "Set WARP mode -> " .. warp_mode },
+        { args = "tunnel protocol set MASQUE",                           label = "Set tunnel protocol -> MASQUE" },
+        { args = "tunnel masque-options set h3-only",                    label = "Set MASQUE HTTP/3 -> h3-only" },
+        { args = string.format("tunnel endpoint set %s:%d", target_ip, target_port), label = string.format("Set endpoint -> %s:%d", target_ip, target_port) },
+        { args = "debug connectivity-check disable",                     label = "Disable connectivity-check" },
+        { args = "debug high-timeouts enable",                           label = "Enable high-timeouts profile" },
+    }
+
+    for _, st in ipairs(steps) do
+        local ok, out = exec_warp_cli(warp_bin, st.args)
+        local status = ok and "OK" or "WARN"
+        print(string.format("  [%s] %s%s", status, st.label, (not ok and out ~= "") and (" (" .. out .. ")") or ""))
+        T.record("warp_cli_step", 0, 0, st.label .. " -> " .. status)
+    end
+
+    -- Critical for Full Tunnel (mode warp): WARP's WFP catch-all Deny firewall blocks the Relay IP unless excluded!
+    local _, ip_list = exec_warp_cli(warp_bin, "tunnel ip list")
+    if ip_list and (ip_list:find(relay_ip .. "/32", 1, true) or ip_list:find(relay_ip, 1, true)) then
+        print(string.format("  [OK] Relay IP %s already in WARP Split Tunnel Exclude list", relay_ip))
+        T.record("warp_cli_exclude", 0, 0, relay_ip .. " already excluded")
+    else
+        local ok_add, out_add = exec_warp_cli(warp_bin, "tunnel ip add " .. relay_ip)
+        print(string.format("  [%s] Exclude Relay IP %s from WARP WFP firewall (warp-cli tunnel ip add)%s",
+            ok_add and "OK" or "WARN", relay_ip, (not ok_add and out_add ~= "") and (" (" .. out_add .. ")") or ""))
+        T.record("warp_cli_exclude", 0, 0, relay_ip .. " add -> " .. (ok_add and "OK" or out_add))
+    end
+
+    return true, warp_bin
+end
+
 local function main()
     print("=========================================================================")
-    print("  Warp Migration Engine - LuaJIT 2.1 + FFI Edition")
+    print("  Warp Migration Engine - QUIC / MASQUE Edition (LuaJIT 2.1 + FFI)")
     print("=========================================================================")
-    print("  [1] WireGuard / UDP Direct Desync Engine (Zero-NAT + Reverse Rekey)")
-    print("  [2] QUIC / MASQUE Handshake Migration Engine (Relay + 1-RTT Direct)")
-    local m = prompt("Select Engine Mode [1 or 2, Default 2]: ")
-    local mode = (m == "1") and 1 or 2
 
-    print("\n  Camouflage Protocols [0=AUTO, 4=WebRTC, 5=DTLS, 7=IPsec ESP, 10=STUN, 1..17]:")
-    local def_p = (mode == 1) and 0 or 7
-    local p_str = prompt(string.format("Select Protocol [Enter for %d]: ", def_p))
-    local proto_id = tonumber(p_str) or def_p
+    local saved = load_config()
+    local is_saved = (saved.relay_ip ~= nil and saved.warp_configured == true)
 
-    if mode == 1 then
-        local rev = prompt("Enable Beta Reverse-Handshake (Role Swap)? [y/N]: "):lower()
-        run_wireguard_engine({ proto_id = proto_id, reverse_rekey = (rev == "y" or rev == "yes") })
-    else
-        local saved = load_config()
-        local relay_ip, relay_port = saved.relay_ip, saved.relay_port or 2632
-        local ans
-        if relay_ip then
-            ans = prompt(string.format("Use saved relay [%s:%d]? (Enter to keep, or IP:PORT): ", relay_ip, relay_port))
-        else
-            ans = prompt("Enter Relay Server [IP:PORT, e.g. 198.51.100.1:2632]: ")
-        end
-        if ans ~= "" then
-            local ip, p = ans:match("^([^:]+):(%d+)$")
-            if ip then relay_ip = ip; relay_port = tonumber(p) else relay_ip = ans end
-        end
-        if not relay_ip or relay_ip == "" then print("[!] Relay IP required."); return end
-        save_config(relay_ip, relay_port)
-        run_masque_engine({
-            proto_id    = proto_id,
-            target_ip   = "162.159.198.2",
-            target_port = 8095,
-            relay_ip    = relay_ip,
-            relay_port  = relay_port,
-            zero_csum   = false,
-        })
+    if is_saved then
+        print(string.format("  Saved Profile  : Relay %s:%d | Target %s:%d | WARP: %s",
+            saved.relay_ip, saved.relay_port or 2632,
+            saved.target_ip or "162.159.198.2", saved.target_port or 8095,
+            saved.warp_mode or "warp"))
     end
+
+    print_all_protocols()
+    local def_p = saved.proto_id or 7
+    local p_prompt = is_saved
+        and string.format("\nSelect Protocol [0..17, r=Reconfigure, Enter for %d (%s)]: ", def_p, def_p == 0 and "auto" or C.get_protocol_by_id(def_p).key)
+        or  string.format("\nSelect Protocol [0..17, Enter for %d (%s)]: ", def_p, def_p == 0 and "auto" or C.get_protocol_by_id(def_p).key)
+    local raw_p = prompt(p_prompt)
+
+    local force_reconfig = (raw_p:lower() == "r")
+    local proto_id = tonumber(raw_p)
+    if not proto_id or proto_id < 0 or proto_id > 17 then proto_id = def_p end
+
+    if is_saved and not force_reconfig then
+        if proto_id ~= saved.proto_id then
+            saved.proto_id = proto_id
+            save_config({
+                relay_ip          = saved.relay_ip,
+                relay_port        = saved.relay_port or 2632,
+                target_ip         = saved.target_ip or "162.159.198.2",
+                target_port       = saved.target_port or 8095,
+                proto_id          = proto_id,
+                warp_mode         = saved.warp_mode or "warp",
+                warp_configured   = true,
+                warp_auto_connect = saved.warp_auto_connect,
+            })
+        end
+        run_masque_engine({
+            proto_id          = proto_id,
+            target_ip         = saved.target_ip or "162.159.198.2",
+            target_port       = saved.target_port or 8095,
+            relay_ip          = saved.relay_ip,
+            relay_port        = saved.relay_port or 2632,
+            warp_auto_setup   = true,
+            warp_mode         = saved.warp_mode or "warp",
+            warp_cli_bin      = find_warp_cli(),
+            warp_auto_connect = saved.warp_auto_connect,
+            zero_csum         = false,
+        })
+        return
+    end
+
+    if force_reconfig then
+        print_all_protocols()
+        local p2 = prompt(string.format("\nSelect Protocol [0..17, Enter for %d (%s)]: ", def_p, def_p == 0 and "auto" or C.get_protocol_by_id(def_p).key))
+        local p2_num = tonumber(p2)
+        if p2_num and p2_num >= 0 and p2_num <= 17 then proto_id = p2_num end
+    end
+
+    local relay_ip, relay_port = saved.relay_ip, saved.relay_port or 2632
+    local ans
+    if relay_ip then
+        ans = prompt(string.format("\nUse saved Relay Server [%s:%d]? (Enter to keep, or IP:PORT): ", relay_ip, relay_port))
+    else
+        ans = prompt("\nEnter Relay Server [IP:PORT, e.g. 198.51.100.1:4678]: ")
+    end
+    if ans ~= "" then
+        local ip, p = C.parse_endpoint_str(ans, relay_port)
+        if ip then relay_ip = ip; relay_port = p else print("[!] Invalid Relay IP:PORT."); return end
+    end
+    if not relay_ip or relay_ip == "" then print("[!] Relay IP required."); return end
+
+    local def_t_ip   = saved.target_ip or "162.159.198.2"
+    local def_t_port = saved.target_port or 8095
+    local t_ans = prompt(string.format("WARP Target Endpoint [%s:%d]? (Enter to keep, or IP:PORT): ", def_t_ip, def_t_port))
+    local target_ip, target_port = def_t_ip, def_t_port
+    if t_ans ~= "" then
+        local tip, tp = C.parse_endpoint_str(t_ans, def_t_port)
+        if tip then target_ip = tip; target_port = tp else print("[!] Invalid Target IP:PORT, keeping default.") end
+    end
+
+    local warp_auto = false
+    local warp_mode = "manual"
+    local warp_bin = nil
+    local warp_auto_connect = false
+
+    local use_official = prompt("\nUsing Official Cloudflare WARP client? Auto-configure it now? [Y/n]: "):lower()
+    if use_official == "" or use_official == "y" or use_official == "yes" then
+        print("  [1] Full Tunnel (warp) [Recommended — routes all Windows traffic]")
+        print("  [2] Local SOCKS5 Proxy (proxy on 127.0.0.1:40000)")
+        local wm = prompt("Select Official WARP Mode [1 or 2, Default 1]: ")
+        warp_mode = (wm == "2") and "proxy" or "warp"
+        warp_auto, warp_bin = configure_official_warp(relay_ip, target_ip, target_port, warp_mode)
+        if warp_auto then
+            local ac = prompt("Auto-connect Cloudflare WARP right after engine starts? [Y/n]: "):lower()
+            warp_auto_connect = (ac == "" or ac == "y" or ac == "yes")
+        end
+    end
+
+    save_config({
+        relay_ip          = relay_ip,
+        relay_port        = relay_port,
+        target_ip         = target_ip,
+        target_port       = target_port,
+        proto_id          = proto_id,
+        warp_mode         = warp_mode,
+        warp_configured   = warp_auto,
+        warp_auto_connect = warp_auto_connect,
+    })
+
+    run_masque_engine({
+        proto_id          = proto_id,
+        target_ip         = target_ip,
+        target_port       = target_port,
+        relay_ip          = relay_ip,
+        relay_port        = relay_port,
+        warp_auto_setup   = warp_auto,
+        warp_mode         = warp_mode,
+        warp_cli_bin      = warp_bin,
+        warp_auto_connect = warp_auto_connect,
+        zero_csum         = false,
+    })
 end
 
 main()

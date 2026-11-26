@@ -75,7 +75,7 @@ local EPOLLIN       = 1
 local EPOLL_CTL_ADD = 1
 local EPOLL_CTL_DEL = 2
 
-local SESSION_TIMEOUT_SECS = 60
+local SESSION_TIMEOUT_SECS = C.RELAY_SESSION_TTL_S
 local MAX_SESSIONS = 4096
 
 local function htons(v)
@@ -138,6 +138,10 @@ local function main()
     end
 
     local epfd = ffi.C.epoll_create1(0)
+    if epfd < 0 then
+        io.stderr:write("[ERROR] epoll_create1 failed\n")
+        os.exit(1)
+    end
     local ev = ffi.new("struct epoll_event")
     ev.events = EPOLLIN; ev.data.fd = listen_v4
     ffi.C.epoll_ctl(epfd, EPOLL_CTL_ADD, listen_v4, ev)
@@ -168,7 +172,6 @@ local function main()
         if session_count >= MAX_SESSIONS then return nil end
         local up_v4 = create_udp_socket(false, 0)
         if up_v4 < 0 then return nil end
-        local up_v6 = create_udp_socket(true, 0)
 
         local client_addr_copy = ffi.new("uint8_t[?]", addr_sz)
         ffi.copy(client_addr_copy, addr_ptr, addr_sz)
@@ -179,7 +182,7 @@ local function main()
             client_addr_len = addr_sz,
             listen_fd = is_v6 and listen_v6 or listen_v4,
             up_v4 = up_v4,
-            up_v6 = up_v6,
+            up_v6 = -1, -- lazy-created on demand for IPv6 upstream targets
             proto_id = proto_id,
             in_count = 0,
             last_seen = os.time(),
@@ -189,12 +192,18 @@ local function main()
         fd_to_sess[up_v4] = sess
         ev.events = EPOLLIN; ev.data.fd = up_v4
         ffi.C.epoll_ctl(epfd, EPOLL_CTL_ADD, up_v4, ev)
-        if up_v6 >= 0 then
-            fd_to_sess[up_v6] = sess
-            ev.data.fd = up_v6
-            ffi.C.epoll_ctl(epfd, EPOLL_CTL_ADD, up_v6, ev)
-        end
         return sess
+    end
+
+    local function ensure_up_v6(sess)
+        if sess.up_v6 >= 0 then return true end
+        local fd6 = create_udp_socket(true, 0)
+        if fd6 < 0 then return false end
+        sess.up_v6 = fd6
+        fd_to_sess[fd6] = sess
+        ev.events = EPOLLIN; ev.data.fd = fd6
+        ffi.C.epoll_ctl(epfd, EPOLL_CTL_ADD, fd6, ev)
+        return true
     end
 
     local function purge_expired(now)
@@ -248,7 +257,7 @@ local function main()
                                     sess.last_seen = now
                                     local pay_ptr = rx_buf + env_len
                                     local pay_len = n - env_len
-                                    if is_t6 and sess.up_v6 >= 0 then
+                                    if is_t6 and ensure_up_v6(sess) then
                                         ffi.copy(target_v6.sin6_addr.s6_addr, rx_buf + 8, 16)
                                         target_v6.sin6_port = htons(t_port)
                                         ffi.C.sendto(sess.up_v6, pay_ptr, pay_len, 0, ffi.cast("const struct sockaddr*", target_v6), ffi.sizeof("struct sockaddr_in6"))
@@ -258,9 +267,9 @@ local function main()
                                         ffi.C.sendto(sess.up_v4, pay_ptr, pay_len, 0, ffi.cast("const struct sockaddr*", target_v4), ffi.sizeof("struct sockaddr_in"))
                                     end
                                     pkt_count = pkt_count + 1
-                                    if pkt_count <= 5 or pkt_count % 100 == 0 then
+                                    if pkt_count <= 5 or pkt_count % 250 == 0 then
                                         local pinfo = C.get_protocol_by_id(proto_id)
-                                        print(string.format("[RELAY OUT #%d] Proto [%s] -> %d B (Env %dB)", pkt_count, pinfo.key, pay_len, env_len))
+                                        print(string.format("[RELAY] Out #%d | Active=%d | Proto [%d:%s] -> %dB", pkt_count, session_count, pinfo.id, pinfo.key, pay_len))
                                         io.flush()
                                     end
                                 end
