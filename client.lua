@@ -244,6 +244,7 @@ local function run_masque_engine(cfg)
     local hs_no_reply_cnt = 0
     local hb_last_ms = T.now_ms()
     local hb_last_tx_b, hb_last_rx_b = 0, 0
+    local hb_flush_cnt = 0
 
     local function reset_unmigrated_timers(new_proto_id)
         local now_r = T.now_ms()
@@ -425,10 +426,14 @@ local function run_masque_engine(cfg)
                         hb_last_ms = hb_now
                         hb_last_tx_b = T.live.direct_tx_bytes
                         hb_last_rx_b = T.live.direct_rx_bytes
+                        hb_flush_cnt = hb_flush_cnt + 1
                         log_msg("%s [LIVE AI] %s | TX: %.1f KB/s | RX: %.1f KB/s | Pkts: %d/%d",
                             ts_prefix(), T.live.active_endpoint, tx_kbs, rx_kbs, T.live.direct_tx_pkts, T.live.direct_rx_pkts)
                         for kp, sp in pairs(sessions) do
                             if not sp.migrated and (hb_now - sp.start_ms) > 180000 then sessions[kp] = nil end
+                        end
+                        if hb_flush_cnt % 4 == 0 then
+                            T.flush_json("ai_report.json")
                         end
                         local pol_act = T.eval_evolved_policy()
                         if pol_act and pol_act.action == "DIVERSE_SWITCH" then
